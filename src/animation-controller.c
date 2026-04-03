@@ -40,6 +40,18 @@ static obs_source_t *create_media_source(const char *name, const char *path)
 	return src;
 }
 
+static obs_source_t *create_image_source(const char *name, const char *path)
+{
+	obs_data_t *settings = obs_data_create();
+	obs_data_set_string(settings, "file", path);
+
+	obs_source_t *src =
+		obs_source_create_private("image_source", name, settings);
+	obs_data_release(settings);
+
+	return src;
+}
+
 static void release_source(obs_source_t **src)
 {
 	if (!*src)
@@ -132,7 +144,8 @@ static void output_audio_chunk(struct animation_controller *ac,
 		if (done)
 			ac->ping_audio[i].playing = false;
 
-		if (ping_has_data)
+		/* Keep active if ping produced data OR still has future data */
+		if (ping_has_data || ac->ping_audio[i].playing)
 			any_playing = true;
 	}
 
@@ -147,11 +160,8 @@ static void output_audio_chunk(struct animation_controller *ac,
 	out.format = AUDIO_FORMAT_FLOAT_PLANAR;
 	out.samples_per_sec = sample_rate;
 
-	struct obs_audio_info oai;
-	if (obs_get_audio_info(&oai))
-		out.speakers = oai.speakers;
-	else
-		out.speakers = SPEAKERS_STEREO;
+	/* Match speakers to actual data channels */
+	out.speakers = (pcm_ch >= 2) ? SPEAKERS_STEREO : SPEAKERS_MONO;
 
 	out.timestamp = timestamp;
 
@@ -190,7 +200,7 @@ void animation_controller_free(struct animation_controller *ac)
 }
 
 void animation_controller_load_overlay(struct animation_controller *ac,
-				       const char *path)
+				       const char *path, bool is_video)
 {
 	for (int i = 0; i < MAX_PINGS; i++)
 		release_source(&ac->overlay_sources[i]);
@@ -198,10 +208,17 @@ void animation_controller_load_overlay(struct animation_controller *ac,
 	if (!path || !*path)
 		return;
 
+	ac->is_video = is_video;
+
 	for (int i = 0; i < MAX_PINGS; i++) {
 		char name[64];
 		snprintf(name, sizeof(name), "mia-pin-overlay-%d", i);
-		ac->overlay_sources[i] = create_media_source(name, path);
+		if (is_video)
+			ac->overlay_sources[i] =
+				create_media_source(name, path);
+		else
+			ac->overlay_sources[i] =
+				create_image_source(name, path);
 	}
 
 	if (!ac->overlay_sources[0])
@@ -321,10 +338,39 @@ void animation_controller_start(struct animation_controller *ac,
 	/* Initialize audio playback state */
 	ac->playback_cursor = 0;
 	ac->playback_start_ts = os_gettime_ns();
+	ac->next_audio_ts = ac->playback_start_ts;
 	ac->playback_active = ac->pcm_loaded || ac->pcm_se_loaded;
 
 	struct obs_audio_info oai;
 	uint32_t sr = obs_get_audio_info(&oai) ? oai.samples_per_sec : 48000;
+
+	/* Send a silent primer chunk to reset OBS audio timestamp tracking.
+	 * Without this, the second animation's timestamps can be rejected
+	 * by OBS's internal smoothing logic after the first animation's
+	 * audio buffer has been drained. */
+	if (ac->playback_active && ac->parent_source) {
+		size_t pcm_ch = 0;
+		if (ac->pcm_loaded)
+			pcm_ch = ac->pcm.channels;
+		if (ac->pcm_se_loaded && ac->pcm_se.channels > pcm_ch)
+			pcm_ch = ac->pcm_se.channels;
+		if (pcm_ch == 0)
+			pcm_ch = 2;
+
+		float silence[MAX_AV_PLANES][AUDIO_CHUNK_FRAMES];
+		memset(silence, 0, sizeof(silence));
+
+		struct obs_source_audio prime = {0};
+		prime.frames = AUDIO_CHUNK_FRAMES;
+		prime.format = AUDIO_FORMAT_FLOAT_PLANAR;
+		prime.samples_per_sec = sr;
+		prime.speakers = (pcm_ch >= 2) ? SPEAKERS_STEREO
+						: SPEAKERS_MONO;
+		prime.timestamp = ac->playback_start_ts;
+		for (size_t ch = 0; ch < pcm_ch && ch < MAX_AV_PLANES; ch++)
+			prime.data[ch] = (const uint8_t *)silence[ch];
+		obs_source_output_audio(ac->parent_source, &prime);
+	}
 
 	/* Set each ping's start sample based on stagger interval */
 	for (int i = 0; i < ping_count && i < MAX_PINGS; i++) {
@@ -373,18 +419,38 @@ bool animation_controller_tick(struct animation_controller *ac, float seconds)
 		uint32_t sr = ac->pcm_loaded
 				      ? ac->pcm.sample_rate
 				      : ac->pcm_se.sample_rate;
-		size_t frames = (size_t)((float)sr * seconds);
-		if (frames < 1)
-			frames = 1;
-		if (frames > AUDIO_CHUNK_FRAMES)
-			frames = AUDIO_CHUNK_FRAMES;
 
-		/* Compute timestamp for this chunk */
-		uint64_t ts = ac->playback_start_ts +
-			      (uint64_t)ac->playback_cursor * 1000000000ULL /
-				      (uint64_t)sr;
+		if (ac->is_video) {
+			/* Video mode: original logic (unchanged) */
+			size_t frames = (size_t)((float)sr * seconds);
+			if (frames < 1)
+				frames = 1;
+			if (frames > AUDIO_CHUNK_FRAMES)
+				frames = AUDIO_CHUNK_FRAMES;
 
-		output_audio_chunk(ac, frames, ts);
+			uint64_t ts = ac->playback_start_ts +
+				      (uint64_t)ac->playback_cursor *
+					      1000000000ULL / (uint64_t)sr;
+
+			output_audio_chunk(ac, frames, ts);
+		} else {
+			/* Image mode: fixed-size chunks, clock-based.
+			 * Cap iterations to avoid runaway cursor if
+			 * there is a large time gap (e.g. at start). */
+			uint64_t now = os_gettime_ns();
+			int max_chunks = (int)(sr / AUDIO_CHUNK_FRAMES) + 1;
+			int chunks = 0;
+			while (ac->next_audio_ts <= now &&
+			       ac->playback_active &&
+			       chunks < max_chunks) {
+				output_audio_chunk(ac, AUDIO_CHUNK_FRAMES,
+						   ac->next_audio_ts);
+				ac->next_audio_ts +=
+					(uint64_t)AUDIO_CHUNK_FRAMES *
+					1000000000ULL / (uint64_t)sr;
+				chunks++;
+			}
+		}
 	}
 
 	/* Check animation completion (grace period for media startup) */
@@ -418,8 +484,13 @@ bool animation_controller_any_visible(struct animation_controller *ac)
 	if (!ac->active)
 		return false;
 	for (int i = 0; i < ac->pings_spawned && i < MAX_PINGS; i++) {
-		if (is_media_playing(ac->overlay_sources[i]))
-			return true;
+		if (ac->is_video) {
+			if (is_media_playing(ac->overlay_sources[i]))
+				return true;
+		} else {
+			if (ac->ping_audio[i].playing)
+				return true;
+		}
 	}
 	return false;
 }
@@ -459,8 +530,13 @@ void animation_controller_render(struct animation_controller *ac)
 	gs_blend_function(GS_BLEND_SRCALPHA, GS_BLEND_INVSRCALPHA);
 
 	for (int i = 0; i < ac->pings_spawned && i < MAX_PINGS; i++) {
-		if (!is_media_playing(ac->overlay_sources[i]))
-			continue;
+		if (ac->is_video) {
+			if (!is_media_playing(ac->overlay_sources[i]))
+				continue;
+		} else {
+			if (!ac->ping_audio[i].playing)
+				continue;
+		}
 
 		struct ping_position *pos = &ac->positions[i];
 		float draw_x = pos->x - scaled_cx / 2.0f;

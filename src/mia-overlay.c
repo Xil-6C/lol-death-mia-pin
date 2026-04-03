@@ -127,7 +127,8 @@ static void *mia_overlay_create(obs_data_t *settings, obs_source_t *source)
 
 	/* Animation init */
 	animation_controller_init(&d->anim, source);
-	animation_controller_load_overlay(&d->anim, d->overlay_path);
+	animation_controller_load_overlay(&d->anim, d->overlay_path,
+					 path_is_video(d->overlay_path));
 	setup_audio_sources(d);
 	animation_controller_set_volume(
 		&d->anim,
@@ -182,8 +183,9 @@ static void mia_overlay_update(void *data, obs_data_t *settings)
 		if (overlay_changed) {
 			bfree(d->overlay_path);
 			d->overlay_path = bstrdup(new_overlay);
-			animation_controller_load_overlay(&d->anim,
-							  d->overlay_path);
+			animation_controller_load_overlay(
+				&d->anim, d->overlay_path,
+				path_is_video(d->overlay_path));
 		}
 		if (sound_changed) {
 			bfree(d->sound_path);

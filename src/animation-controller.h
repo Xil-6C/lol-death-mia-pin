@@ -19,8 +19,9 @@ struct animation_controller {
 	/* Parent source -- audio output target */
 	obs_source_t *parent_source;
 
-	/* Overlay media sources (one private ffmpeg_source per ping) */
+	/* Overlay media sources (ffmpeg_source for video, image_source for image) */
 	obs_source_t *overlay_sources[MAX_PINGS];
+	bool is_video;
 
 	/* Pre-decoded PCM audio (primary: video audio or SE) */
 	struct pcm_audio pcm;
@@ -39,6 +40,7 @@ struct animation_controller {
 	/* Global playback cursor (managed by tick) */
 	int64_t playback_cursor;
 	uint64_t playback_start_ts; /* os_gettime_ns() at start */
+	uint64_t next_audio_ts;     /* next chunk timestamp (image mode) */
 	bool playback_active;
 	float se_volume;
 
@@ -67,7 +69,7 @@ void animation_controller_init(struct animation_controller *ac,
 void animation_controller_free(struct animation_controller *ac);
 
 void animation_controller_load_overlay(struct animation_controller *ac,
-				       const char *path);
+				       const char *path, bool is_video);
 void animation_controller_load_audio(struct animation_controller *ac,
 				     const char *path);
 void animation_controller_load_se_audio(struct animation_controller *ac,
