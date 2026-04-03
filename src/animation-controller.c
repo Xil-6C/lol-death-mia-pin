@@ -151,8 +151,6 @@ static void output_audio_chunk(struct animation_controller *ac,
 
 	if (!any_playing) {
 		ac->playback_active = false;
-		blog(LOG_INFO, "[mia-pin] AUDIO DONE: cursor=%lld",
-		     (long long)ac->playback_cursor);
 		return;
 	}
 
@@ -327,10 +325,6 @@ void animation_controller_start(struct animation_controller *ac,
 
 	ac->total_pings = ping_count;
 	ac->active = true;
-	blog(LOG_INFO, "[mia-pin] START: pings=%d, image_duration=%.3f, "
-	     "pcm_loaded=%d, is_video=%d",
-	     ping_count, ac->image_duration,
-	     ac->pcm_loaded, ac->is_video);
 	ac->render_cx = source_cx;
 
 	generate_positions(ac, ping_count, source_cx, source_cy);
@@ -381,11 +375,6 @@ void animation_controller_start(struct animation_controller *ac,
 				(const uint8_t *)ac->audio_buf[ch];
 		obs_source_output_audio(ac->parent_source, &prime);
 	}
-
-	blog(LOG_INFO, "[mia-pin] START post-primer: "
-	     "playback_start_ts=%llu, now=%llu",
-	     (unsigned long long)ac->playback_start_ts,
-	     (unsigned long long)os_gettime_ns());
 
 	/* Set each ping's start sample based on stagger interval */
 	for (int i = 0; i < ping_count && i < MAX_PINGS; i++) {
@@ -483,9 +472,6 @@ bool animation_controller_tick(struct animation_controller *ac, float seconds)
 	    ac->anim_elapsed > 0.5f &&
 	    !animation_controller_any_visible(ac) &&
 	    !ac->playback_active) {
-		blog(LOG_INFO, "[mia-pin] COMPLETE: elapsed=%.3f, "
-		     "playback_active=%d",
-		     ac->anim_elapsed, ac->playback_active);
 		ac->active = false;
 		for (int i = 0; i < ac->total_pings; i++)
 			if (ac->overlay_sources[i])

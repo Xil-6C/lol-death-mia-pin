@@ -476,8 +476,6 @@ static void mia_overlay_video_tick(void *data, float seconds)
 	if (game_active && lol_api_client_consume_death(&d->api_client,
 							&api_deaths) &&
 	    !d->anim.active) {
-		blog(LOG_INFO, "[mia-pin] DEATH CONSUMED: api_deaths=%d, "
-		     "anim_active=%d", api_deaths, d->anim.active);
 		int count;
 		float interval;
 		if (d->escalate_mode) {
