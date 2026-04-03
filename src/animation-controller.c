@@ -151,6 +151,8 @@ static void output_audio_chunk(struct animation_controller *ac,
 
 	if (!any_playing) {
 		ac->playback_active = false;
+		blog(LOG_INFO, "[mia-pin] AUDIO DONE: cursor=%lld",
+		     (long long)ac->playback_cursor);
 		return;
 	}
 
@@ -325,6 +327,10 @@ void animation_controller_start(struct animation_controller *ac,
 
 	ac->total_pings = ping_count;
 	ac->active = true;
+	blog(LOG_INFO, "[mia-pin] START: pings=%d, image_duration=%.3f, "
+	     "pcm_loaded=%d, is_video=%d",
+	     ping_count, ac->image_duration,
+	     ac->pcm_loaded, ac->is_video);
 	ac->render_cx = source_cx;
 
 	generate_positions(ac, ping_count, source_cx, source_cy);
@@ -357,8 +363,11 @@ void animation_controller_start(struct animation_controller *ac,
 		if (pcm_ch == 0)
 			pcm_ch = 2;
 
-		float silence[MAX_AV_PLANES][AUDIO_CHUNK_FRAMES];
-		memset(silence, 0, sizeof(silence));
+		/* Use the existing audio_buf (zeroed) as silence source
+		 * to avoid large stack allocation */
+		for (size_t ch = 0; ch < pcm_ch && ch < MAX_AV_PLANES; ch++)
+			memset(ac->audio_buf[ch], 0,
+			       AUDIO_CHUNK_FRAMES * sizeof(float));
 
 		struct obs_source_audio prime = {0};
 		prime.frames = AUDIO_CHUNK_FRAMES;
@@ -368,9 +377,15 @@ void animation_controller_start(struct animation_controller *ac,
 						: SPEAKERS_MONO;
 		prime.timestamp = ac->playback_start_ts;
 		for (size_t ch = 0; ch < pcm_ch && ch < MAX_AV_PLANES; ch++)
-			prime.data[ch] = (const uint8_t *)silence[ch];
+			prime.data[ch] =
+				(const uint8_t *)ac->audio_buf[ch];
 		obs_source_output_audio(ac->parent_source, &prime);
 	}
+
+	blog(LOG_INFO, "[mia-pin] START post-primer: "
+	     "playback_start_ts=%llu, now=%llu",
+	     (unsigned long long)ac->playback_start_ts,
+	     (unsigned long long)os_gettime_ns());
 
 	/* Set each ping's start sample based on stagger interval */
 	for (int i = 0; i < ping_count && i < MAX_PINGS; i++) {
@@ -383,11 +398,15 @@ void animation_controller_start(struct animation_controller *ac,
 		ac->ping_audio[i].start_sample = 0;
 	}
 
-	/* Spawn first overlay (video only). Remaining spawn in tick. */
+	/* Spawn first overlay. Remaining spawn in tick. */
 	ac->pings_spawned = 1;
 	ac->spawn_elapsed = 0.0f;
 	ac->overlay_cx = 0;
 	ac->overlay_cy = 0;
+
+	ac->anim_elapsed = 0.0f;
+	memset(ac->ping_spawn_time, 0, sizeof(ac->ping_spawn_time));
+	ac->ping_spawn_time[0] = 0.0f;
 
 	if (ac->overlay_sources[0])
 		obs_source_media_restart(ac->overlay_sources[0]);
@@ -398,6 +417,8 @@ bool animation_controller_tick(struct animation_controller *ac, float seconds)
 	if (!ac->active)
 		return false;
 
+	ac->anim_elapsed += seconds;
+
 	/* Spawn additional pings */
 	if (ac->pings_spawned < ac->total_pings) {
 		ac->spawn_elapsed += seconds;
@@ -407,6 +428,7 @@ bool animation_controller_tick(struct animation_controller *ac, float seconds)
 
 			int idx = ac->pings_spawned;
 			ac->pings_spawned++;
+			ac->ping_spawn_time[idx] = ac->anim_elapsed;
 
 			if (ac->overlay_sources[idx])
 				obs_source_media_restart(
@@ -434,30 +456,36 @@ bool animation_controller_tick(struct animation_controller *ac, float seconds)
 
 			output_audio_chunk(ac, frames, ts);
 		} else {
-			/* Image mode: fixed-size chunks, clock-based.
-			 * Cap iterations to avoid runaway cursor if
-			 * there is a large time gap (e.g. at start). */
+			/* Image mode: wall-clock based sample count.
+			 * Outputs every tick (no skips) and avoids
+			 * float truncation drift of the seconds approach
+			 * by using absolute elapsed time. */
 			uint64_t now = os_gettime_ns();
-			int max_chunks = (int)(sr / AUDIO_CHUNK_FRAMES) + 1;
-			int chunks = 0;
-			while (ac->next_audio_ts <= now &&
-			       ac->playback_active &&
-			       chunks < max_chunks) {
-				output_audio_chunk(ac, AUDIO_CHUNK_FRAMES,
-						   ac->next_audio_ts);
-				ac->next_audio_ts +=
-					(uint64_t)AUDIO_CHUNK_FRAMES *
-					1000000000ULL / (uint64_t)sr;
-				chunks++;
+			uint64_t elapsed = now - ac->playback_start_ts;
+			int64_t expected = (int64_t)(
+				(double)elapsed * (double)sr /
+				1000000000.0);
+			int64_t needed = expected - ac->playback_cursor;
+			if (needed > 0) {
+				if (needed > AUDIO_CHUNK_FRAMES)
+					needed = AUDIO_CHUNK_FRAMES;
+				uint64_t ts = ac->playback_start_ts +
+					      (uint64_t)ac->playback_cursor *
+						      1000000000ULL /
+						      (uint64_t)sr;
+				output_audio_chunk(ac, (size_t)needed, ts);
 			}
 		}
 	}
 
 	/* Check animation completion (grace period for media startup) */
-	uint64_t elapsed_ns = os_gettime_ns() - ac->playback_start_ts;
 	if (ac->pings_spawned >= ac->total_pings &&
-	    elapsed_ns > 500000000ULL &&
-	    !animation_controller_any_visible(ac)) {
+	    ac->anim_elapsed > 0.5f &&
+	    !animation_controller_any_visible(ac) &&
+	    !ac->playback_active) {
+		blog(LOG_INFO, "[mia-pin] COMPLETE: elapsed=%.3f, "
+		     "playback_active=%d",
+		     ac->anim_elapsed, ac->playback_active);
 		ac->active = false;
 		for (int i = 0; i < ac->total_pings; i++)
 			if (ac->overlay_sources[i])
@@ -479,6 +507,16 @@ static bool is_media_playing(obs_source_t *src)
 	       state == OBS_MEDIA_STATE_BUFFERING;
 }
 
+/* Time-based visibility for image mode (uses accumulated seconds,
+ * not os_gettime_ns, to avoid platform timer discontinuities) */
+static bool is_image_ping_visible(struct animation_controller *ac, int i)
+{
+	if (i >= ac->pings_spawned)
+		return false;
+	float since_spawn = ac->anim_elapsed - ac->ping_spawn_time[i];
+	return since_spawn >= 0.0f && since_spawn < ac->image_duration;
+}
+
 bool animation_controller_any_visible(struct animation_controller *ac)
 {
 	if (!ac->active)
@@ -488,7 +526,7 @@ bool animation_controller_any_visible(struct animation_controller *ac)
 			if (is_media_playing(ac->overlay_sources[i]))
 				return true;
 		} else {
-			if (ac->ping_audio[i].playing)
+			if (is_image_ping_visible(ac, i))
 				return true;
 		}
 	}
@@ -534,7 +572,7 @@ void animation_controller_render(struct animation_controller *ac)
 			if (!is_media_playing(ac->overlay_sources[i]))
 				continue;
 		} else {
-			if (!ac->ping_audio[i].playing)
+			if (!is_image_ping_visible(ac, i))
 				continue;
 		}
 

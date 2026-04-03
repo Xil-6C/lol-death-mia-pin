@@ -48,6 +48,11 @@ struct mia_overlay_data {
 #define SETTING_PING_SCALE        "ping_scale"
 #define SETTING_SE_VOLUME        "se_volume"
 #define SETTING_ESCALATE_MODE    "escalate_mode"
+#define SETTING_IMG_DURATION_MODE "img_duration_mode"
+#define SETTING_IMG_DURATION      "img_duration"
+
+#define IMG_DURATION_AUTO   0
+#define IMG_DURATION_MANUAL 1
 
 /* ----------------------------------------------------------------- */
 /* Helpers                                                            */
@@ -87,6 +92,28 @@ static void setup_audio_sources(struct mia_overlay_data *d)
 		if (d->anim.overlay_sources[i])
 			obs_source_set_volume(d->anim.overlay_sources[i],
 					      0.0f);
+	}
+}
+
+static void update_image_duration(struct mia_overlay_data *d,
+				  obs_data_t *settings)
+{
+	if (path_is_video(d->overlay_path))
+		return;
+
+	int mode = (int)obs_data_get_int(settings, SETTING_IMG_DURATION_MODE);
+	if (mode == IMG_DURATION_MANUAL) {
+		d->anim.image_duration =
+			(float)obs_data_get_double(settings,
+						   SETTING_IMG_DURATION);
+	} else {
+		/* Auto: derive from SE file length */
+		if (d->anim.pcm_loaded && d->anim.pcm.sample_rate > 0)
+			d->anim.image_duration =
+				(float)d->anim.pcm.total_frames /
+				(float)d->anim.pcm.sample_rate;
+		else
+			d->anim.image_duration = 1.0f;
 	}
 }
 
@@ -134,9 +161,7 @@ static void *mia_overlay_create(obs_data_t *settings, obs_source_t *source)
 		&d->anim,
 		(float)obs_data_get_double(settings, SETTING_SE_VOLUME)
 			/ 100.0f);
-
-	/* Audio flows through OBS pipeline via capture callbacks.
-	 * User can enable monitoring in OBS advanced audio properties. */
+	update_image_duration(d, settings);
 
 	return d;
 }
@@ -215,6 +240,7 @@ static void mia_overlay_update(void *data, obs_data_t *settings)
 		&d->anim,
 		(float)obs_data_get_double(settings, SETTING_SE_VOLUME)
 			/ 100.0f);
+	update_image_duration(d, settings);
 }
 
 static void mia_overlay_defaults(obs_data_t *settings)
@@ -226,6 +252,9 @@ static void mia_overlay_defaults(obs_data_t *settings)
 	obs_data_set_default_double(settings, SETTING_PING_SCALE, 35.0);
 	obs_data_set_default_double(settings, SETTING_SE_VOLUME, 100.0);
 	obs_data_set_default_bool(settings, SETTING_ESCALATE_MODE, false);
+	obs_data_set_default_int(settings, SETTING_IMG_DURATION_MODE,
+				 IMG_DURATION_AUTO);
+	obs_data_set_default_double(settings, SETTING_IMG_DURATION, 1.0);
 }
 
 static bool escalate_mode_changed(obs_properties_t *props,
@@ -238,6 +267,37 @@ static bool escalate_mode_changed(obs_properties_t *props,
 		obs_properties_get(props, SETTING_PING_COUNT), !on);
 	obs_property_set_visible(
 		obs_properties_get(props, SETTING_PING_INTERVAL), !on);
+	return true;
+}
+
+static bool img_duration_mode_changed(obs_properties_t *props,
+				      obs_property_t *prop,
+				      obs_data_t *settings)
+{
+	UNUSED_PARAMETER(prop);
+	int mode = (int)obs_data_get_int(settings, SETTING_IMG_DURATION_MODE);
+	obs_property_set_visible(
+		obs_properties_get(props, SETTING_IMG_DURATION),
+		mode == IMG_DURATION_MANUAL);
+	return true;
+}
+
+static bool overlay_path_changed(obs_properties_t *props,
+				 obs_property_t *prop,
+				 obs_data_t *settings)
+{
+	UNUSED_PARAMETER(prop);
+	const char *path = obs_data_get_string(settings,
+					       SETTING_OVERLAY_PATH);
+	bool is_image = path && *path && !path_is_video(path);
+	int mode = (int)obs_data_get_int(settings, SETTING_IMG_DURATION_MODE);
+
+	obs_property_set_visible(
+		obs_properties_get(props, SETTING_IMG_DURATION_MODE),
+		is_image);
+	obs_property_set_visible(
+		obs_properties_get(props, SETTING_IMG_DURATION),
+		is_image && mode == IMG_DURATION_MANUAL);
 	return true;
 }
 
@@ -272,12 +332,15 @@ static obs_properties_t *mia_overlay_properties(void *data)
 	obs_properties_t *props = obs_properties_create();
 
 	/* --- Display --- */
-	obs_properties_add_path(props, SETTING_OVERLAY_PATH,
-				obs_module_text("MIAPinImage"),
-				OBS_PATH_FILE,
-				"Media (*.png *.jpg *.bmp *.gif "
-				"*.webm *.mp4 *.mov)",
-				NULL);
+	obs_property_t *overlay_prop = obs_properties_add_path(
+		props, SETTING_OVERLAY_PATH,
+		obs_module_text("MIAPinImage"),
+		OBS_PATH_FILE,
+		"Media (*.png *.jpg *.bmp *.gif "
+		"*.webm *.mp4 *.mov)",
+		NULL);
+	obs_property_set_modified_callback(overlay_prop, overlay_path_changed);
+
 	obs_properties_add_button(props, "clear_overlay",
 				  obs_module_text("ClearOverlay"),
 				  clear_overlay_clicked);
@@ -294,6 +357,24 @@ static obs_properties_t *mia_overlay_properties(void *data)
 	obs_properties_add_float_slider(props, SETTING_SE_VOLUME,
 					obs_module_text("SEVolume"),
 					0.0, 100.0, 1.0);
+
+	/* --- Image duration (only visible for image overlays) --- */
+	obs_property_t *dur_mode = obs_properties_add_list(
+		props, SETTING_IMG_DURATION_MODE,
+		obs_module_text("ImageDurationMode"),
+		OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(dur_mode,
+				  obs_module_text("ImageDurationAuto"),
+				  IMG_DURATION_AUTO);
+	obs_property_list_add_int(dur_mode,
+				  obs_module_text("ImageDurationManual"),
+				  IMG_DURATION_MANUAL);
+	obs_property_set_modified_callback(dur_mode,
+					   img_duration_mode_changed);
+
+	obs_properties_add_float_slider(props, SETTING_IMG_DURATION,
+					obs_module_text("ImageDuration"),
+					0.1, 10.0, 0.1);
 
 	obs_properties_add_int(props, SETTING_WIDTH,
 			       obs_module_text("OverlayWidth"),
@@ -389,10 +470,14 @@ static void mia_overlay_video_tick(void *data, float seconds)
 	}
 	d->game_was_active = game_active;
 
-	/* Check for death */
+	/* Check for death (always consume to clear flag, but only
+	 * start animation if not already playing) */
 	int api_deaths = 0;
 	if (game_active && lol_api_client_consume_death(&d->api_client,
-							&api_deaths)) {
+							&api_deaths) &&
+	    !d->anim.active) {
+		blog(LOG_INFO, "[mia-pin] DEATH CONSUMED: api_deaths=%d, "
+		     "anim_active=%d", api_deaths, d->anim.active);
 		int count;
 		float interval;
 		if (d->escalate_mode) {

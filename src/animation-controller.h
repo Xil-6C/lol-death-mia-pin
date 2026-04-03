@@ -54,6 +54,11 @@ struct animation_controller {
 	float spawn_elapsed;
 	float stagger_interval;   /* seconds between ping spawns */
 
+	/* Image display timing (image mode only) */
+	float image_duration;               /* seconds to display each ping */
+	float anim_elapsed;                 /* accumulated seconds since start */
+	float ping_spawn_time[MAX_PINGS];   /* seconds since anim start per ping */
+
 	/* Rendering */
 	uint32_t render_cx;   /* source width -- for scale calculation */
 	float ping_scale;     /* fraction of source width per ping */
