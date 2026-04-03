@@ -1,0 +1,33 @@
+# Claude Code
+.claude/
+
+# Build output
+build/
+
+# Dependencies
+deps/
+
+# Distribution
+dist/
+
+# Project management
+Phase.md
+Progress.md
+Problem.md
+logs/
+
+# Delivery (private distribution)
+delivery/
+
+# Local scripts
+deploy.ps1
+
+# IDE
+.vs/
+.vscode/
+*.user
+CMakeSettings.json
+
+# OS
+Thumbs.db
+Desktop.ini
