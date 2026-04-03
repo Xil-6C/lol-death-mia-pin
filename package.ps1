@@ -29,10 +29,12 @@ New-Item -ItemType Directory -Path $DataDest   -Force | Out-Null
 Copy-Item $DLL $PluginDest
 Copy-Item (Join-Path $LocaleDir "*.ini") $DataDest
 
-# Copy sample file
-$SampleFile = Join-Path $Delivery "mia_off.webm"
-if (Test-Path $SampleFile) {
-    Copy-Item $SampleFile $StageDir
+# Copy delivery files
+foreach ($f in @("mia.webm", "README.txt")) {
+    $src = Join-Path $Delivery $f
+    if (Test-Path $src) {
+        Copy-Item $src $StageDir
+    }
 }
 
 # Create ZIP
@@ -48,7 +50,8 @@ Write-Host ""
 Write-Host "Package created: dist\lol-death-mia-pin.zip ($Size KB)" -ForegroundColor Green
 Write-Host ""
 Write-Host "ZIP contents:" -ForegroundColor Cyan
-Write-Host "  mia_off.webm"
+Write-Host "  mia.webm"
+Write-Host "  README.txt"
 Write-Host "  obs-plugins/64bit/lol-death-mia-pin.dll"
 Write-Host "  data/obs-plugins/lol-death-mia-pin/locale/en-US.ini"
 Write-Host "  data/obs-plugins/lol-death-mia-pin/locale/ja-JP.ini"
